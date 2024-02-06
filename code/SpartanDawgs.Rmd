@@ -1,0 +1,1070 @@
+---
+title: "K-Means Clustering and PCA in Pitching Role Evaluation"
+author: "Arjun Parmar"
+date: "2024-01-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Initialize Session
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse) #Everything 
+library(plotly) #3D Graphs
+library(kableExtra) # Table Vis
+library(mice) #Impution 
+library(Boruta) #Logistic Regression
+library(e1071) #SVM
+library(reshape)
+
+
+set.seed(457023495)
+
+# Linked to /data/fangraphs_season_level.csv of the Github repository 
+fangraphs_season_level <- read.csv("https://raw.githubusercontent.com/ajparm/SpartanDawgs/main/data/fangraphs_season_level.csv")
+
+```
+
+# Functions
+
+## Kneedle Algorithm
+
+```{r}
+kneedle <- function(x, y) {
+  #Finds the elbow/knee of a plot 
+  n <- length(x)
+  s <- numeric(n)
+  
+  for (i in 3:(n-2)) {
+    s[i] <- (y[i+1] - y[i]) / (x[i+1] - x[i]) - (y[i] - y[i-1]) / (x[i] - x[i-1])
+  }
+  
+  knee_index <- which.max(s)
+  
+  return(list(index = knee_index, x = x[knee_index], y = y[knee_index]))
+}
+
+```
+
+## Max Min Function
+
+```{r}
+cluster_max_min <- function(cluster){
+  #returns the stats that are the max/min for each group 
+  max <- t(as.data.frame(apply(cluster[["centers"]], 2, which.max)))
+  min <- t(as.data.frame(apply(cluster[["centers"]], 2, which.min)))
+  data <- list(
+    one_max = colnames(max)[apply(max == 1, 2, any)],
+    two_max = colnames(max)[apply(max == 2, 2, any)],
+    three_max = colnames(max)[apply(max == 3, 2, any)],
+    one_min = colnames(min)[apply(min == 1, 2, any)],
+    two_min = colnames(min)[apply(min == 2, 2, any)],
+    three_min = colnames(min)[apply(min == 3, 2, any)]
+  )
+  max_row_length <- max(sapply(data, length))
+  padded_data <- lapply(data, function(x) c(x, rep(NA, max_row_length - length(x))))
+  df <- data.frame(padded_data)
+  print(df)
+}
+```
+
+## Optimal Cluster Number Function
+
+```{r}
+opti_cluster <- function(data){
+  # plots the optimal number of clusters
+  tot.withinss <- vector(mode="character", length=10)
+  for (i in 1:10){
+    Cluster <- kmeans(data, center=i, nstart=20, iter.max = 100)
+    tot.withinss[i] <- Cluster$tot.withinss
+  }
+  
+  kneedle(1:10,as.numeric(tot.withinss[1:10]))
+  
+  plot(1:10, tot.withinss[1:10], type="b", pch=19)
+  abline(v = as.numeric(kneedle(1:10,as.numeric(tot.withinss[1:10]))[1]), col = "red", lty = 2)
+}
+```
+
+## 3D PCA Plot Function
+
+```{r}
+cluster_plot <- function(data,clusters){
+  # Fun 3D graph to see clusters 
+  pca_result <- prcomp(data, scale. = F, center = T)
+  pcs <- pca_result$x[, 1:3]
+  plot_3d <- plot_ly(x = pcs[, 1], y = pcs[, 2], z = pcs[, 3], 
+                     type = "scatter3d", mode = "markers", 
+                     marker = list(color = clusters$cluster))
+  clusters_var_name <- deparse(substitute(clusters))
+  plot_3d <- plot_3d %>%
+    layout(scene = list(
+      xaxis = list(title = "PC 1"),
+      yaxis = list(title = "PC 2"),
+      zaxis = list(title = "PC 3")),
+    title = paste0(clusters_var_name,": 3D PCA Cluster Plot"))
+  plot_3d
+}
+```
+
+## Role Split Plot Function
+
+```{r}
+role_split_plot <- function(data, clusters) {
+  # Shows the role split between the classification methods 
+  cluster_data <- cbind(data, as.data.frame(clusters$cluster))
+  players_groups <- cbind(clusters$cluster, fangraphs_season_level$Role)
+  colnames(players_groups) <- c('group', 'Role')
+  rp <- as.data.frame(players_groups) %>% filter(Role == 0) 
+  sp <- as.data.frame(players_groups) %>% filter(Role == 1) 
+  
+  # Get the maximum count across both RP and SP
+  max_count <- max(max(table(rp$group)), max(table(sp$group)))
+  
+  # Plotting RP using ggplot2
+  plot_rp <- ggplot(rp, aes(x = as.factor(group))) +
+    geom_bar(position = "dodge", stat = "count", fill = "blue", color = "black") +
+    labs(title = "RP Distribution by Cluster", x = "Group", y = "Count") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_cartesian(ylim = c(0, max_count))
+
+  # Plotting SP using ggplot2
+  plot_sp <- ggplot(sp, aes(x = as.factor(group))) +
+    geom_bar(position = "dodge", stat = "count", fill = "red", color = "black") +
+    labs(title = "SP Distribution by Cluster", x = "Group", y = "Count") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_cartesian(ylim = c(0, max_count))
+  
+  par(mfrow = c(2, 1))
+  # Print the two separate graphs
+  print(plot_rp)
+  print(plot_sp)
+}
+
+```
+
+# Normalization
+
+## Absolute Values
+
+Check to see if the absolute measures are different between pitching roles
+
+```{r}
+raw_vars <- c("GS", "IP", "TBF", "W", "L", "CG", "ShO", "SV", "BS", "HLD", "SD", "MD", "Pulls", "R", "ER", "H", "HR", "SO", "BB", "IBB", "HBP", "WP", "BK", "Events", "GB", "LD", "FB", "IFFB", "BU", "IFH", "BUH", "Balls", "Strikes", "RS", "FRM", "maxEV", "Pitches")
+
+absolute_stats <- na.omit(fangraphs_season_level[, raw_vars])
+
+sp <- absolute_stats[fangraphs_season_level$Role == "SP", ]
+rp <- absolute_stats[fangraphs_season_level$Role == "RP", ]
+
+perform_t_test <- function(column_name) {
+  t_test_result <- t.test(sp[, column_name], rp[, column_name])
+  return(data.frame(Column = column_name, P_Value = t_test_result$p.value))
+}
+
+t_test_results <- lapply(names(absolute_stats), perform_t_test)
+t_test_results_df <- do.call(rbind, t_test_results)
+print(t_test_results_df)
+print(t_test_results_df[t_test_results_df$P_Value > .05,])
+```
+
+Normalizing by innings pitched is problematic lots of Inf and NaN values
+
+The values that we do get however, are not great
+
+```{r}
+raw_vars <- c("GS","IP","TBF","W","L","CG","ShO","SV","BS","HLD","SD","MD","Pulls","R","ER","H","HR","SO","BB","IBB","HBP","WP","BK","Events","GB","LD","FB","IFFB","BU","IFH","BUH","Balls","Strikes", "RS", "maxEV", "Pitches")
+
+selected_vars <- na.omit(fangraphs_season_level[, raw_vars])
+selected_vars <- selected_vars[selected_vars$Pitches != 0, ]
+selected_vars <- selected_vars[selected_vars$TBF != 0, ]
+selected_vars <- selected_vars[selected_vars$IP != 0, ]
+
+pitch_norm <- (selected_vars / fangraphs_season_level$Pitches)
+total_batters_faced_norm <- (selected_vars / fangraphs_season_level$TBF)
+innings_pitched_norm <- (selected_vars / fangraphs_season_level$IP)
+
+
+data_frames <- list(pitch_norm, total_batters_faced_norm, innings_pitched_norm)
+norm_list <- c("Pitches", "TBF", "Innings")
+
+num_data_frames <- length(data_frames)
+num_columns <- ncol(data_frames[[1]])
+cor_matrix <- matrix(NA, nrow = num_columns, ncol = num_data_frames^2,
+                     dimnames = list(colnames(data_frames[[1]]), NULL))
+
+# Loop through nomalizations and calculate R2
+for (i in 1:num_columns) {
+  for (j in 1:num_data_frames) {
+    for (k in 1:num_data_frames) {
+      cor_value <- cor(data_frames[[j]][, i], data_frames[[k]][, i], use = "pairwise.complete.obs")
+      cor_matrix[i, (j - 1) * num_data_frames + k] <- cor_value
+      
+      # Print correlation with input names
+      # cat(sprintf("Correlation between %s and %s for variable %s: %.4f\n",norm_list[j], norm_list[k],colnames(data_frames[[1]])[i], cor_value))
+    }
+  }
+}
+
+
+# Print the correlation matrix
+print(cor_matrix)
+
+
+
+```
+
+### Total batters faced vs Pitches thrown
+
+Compare the normalization techniques using correlation
+
+```{r}
+raw_vars <- c("GS","IP","TBF","W","L","CG","ShO","SV","BS","HLD","SD","MD","Pulls","R","ER","H","HR","SO","BB","IBB","HBP","WP","BK","Events","GB","LD","FB","IFFB","BU","IFH","BUH","Balls","Strikes", "RS", "maxEV", "Pitches")
+
+selected_vars <- na.omit(fangraphs_season_level[, raw_vars])
+selected_vars <- selected_vars[selected_vars$Pitches != 0, ]
+selected_vars <- selected_vars[selected_vars$TBF != 0, ]
+
+pitch_norm <- (selected_vars / fangraphs_season_level$Pitches)
+total_batters_faced_norm <- (selected_vars / fangraphs_season_level$TBF)
+
+data_frames <- list(pitch_norm, total_batters_faced_norm)
+norm_list <- c("Pitches", "TBF")
+
+num_data_frames <- length(data_frames)
+num_columns <- ncol(data_frames[[1]])
+cor_matrix <- matrix(NA, nrow = num_columns, ncol = num_data_frames^2,
+                     dimnames = list(colnames(data_frames[[1]]), NULL))
+
+# Loop through nomalizations and calculate R2
+for (i in 1:num_columns) {
+  for (j in 1:num_data_frames) {
+    for (k in 1:num_data_frames) {
+      cor_value <- cor(data_frames[[j]][, i], data_frames[[k]][, i], use = "pairwise.complete.obs")
+      cor_matrix[i, (j - 1) * num_data_frames + k] <- cor_value
+      
+      # Print correlation with input names
+      #cat(sprintf("Correlation between %s and %s for variable %s: %.4f\n",norm_list[j], norm_list[k],colnames(data_frames[[1]])[i], cor_value))
+    }
+  }
+}
+
+
+# Print the correlation matrix
+cor_matrix[,2]
+
+```
+
+### Absolute Stats --\> Normalized to number of pitches (rate stats)
+
+```{r}
+raw_vars <- c("GS","IP","TBF","W","L","CG","ShO","SV","BS","HLD","SD","MD","Pulls","R","ER","H","HR","SO","BB","IBB","HBP","WP","BK","Events","GB","LD","FB","IFFB","BU","IFH","BUH","Balls","Strikes", "RS", "maxEV")
+              
+norm_stats <- (fangraphs_season_level[, names(fangraphs_season_level) %in% raw_vars])/fangraphs_season_level$Pitches
+```
+
+### Catcher Framing: FRM
+
+```{r}
+norm_stats$FRM <- fangraphs_season_level$FRM
+```
+
+### Add the adjusted stats
+
+```{r}
+adjusted_vars <- c("ERA", "RS_per_9","K_pct","BB_pct","K_minus_BB_pct","K_per_9","BB_per_9","K_to_BB","H_per_9","HR_per_9","AVG","WHIP","BABIP","LOB_pct","GB_pct","LD_pct","FB_pct","IFFB_pct","GB_to_FB","HR_to_FB","IFH_pct","BUH_pct","FIP","xFIP","SIERA","tERA","kwERA","E_minus_F","RAR","WAR","Dollars","WPA","RE24","REW","pLI","inLI","gmLI","exLI","WPA_to_LI","Clutch","OSwing_pct","ZSwing_pct","Swing_pct","OContact_pct","ZContact_pct","Contact_pct","Zone_pct","FStrike_pct","SwStr_pct","CStr_pct","CSW_pct","ERA_minus","FIP_minus","xFIP_minus","Pace","RA9_WAR","BIP_Wins","LOB_Wins","FDP_Wins","Pull_pct","Cent_pct","Oppo_pct","Soft_pct","Med_pct","Hard_pct","TTO_pct", "K_pct_plus","BB_pct_plus","K_per_9_plus","BB_per_9_plus","K_to_BB_plus","H_per_9_plus","HR_per_9_plus","AVG_plus","WHIP_plus","BABIP_plus","LOB_pct_plus","GB_pct_plus","LD_pct_plus","FB_pct_plus","HR_to_FB_pct_plus","Pull_pct_plus","Cent_pct_plus","Oppo_pct_plus","Med_pct_plus","Hard_pct_plus","EV","LA", "Barrel_pct","HardHit_pct","FA_pct","FAv","SL_pct","SLv","CT_pct","CTv","CB_pct","CBv","CH_pct","CHv","SF_pct","SFv","KN_pct","KNv","XX_pct","PO_pct","wFB_per_c","wSL_per_c","wCT_per_c","wCB_per_c","wCH_per_c","wSF_per_c","wKN_per_c", "FA_pct_sc","FC_pct_sc","FS_pct_sc","FO_pct_sc","SI_pct_sc","SL_pct_sc","CU_pct_sc","KC_pct_sc","EP_pct_sc","CH_pct_sc","SC_pct_sc","KN_pct_sc","UN_pct_sc","vFA_sc","vFC_sc","vFS_sc","vFO_sc","vSI_sc","vSL_sc","vCU_sc","vKC_sc","vEP_sc","vCH_sc","vSC_sc","vKN_sc","FA_X_sc","FC_X_sc","FS_X_sc","FO_X_sc","SI_X_sc","SL_X_sc","CU_X_sc","KC_X_sc","EP_X_sc","CH_X_sc","SC_X_sc","KN_X_sc","FA_Z_sc","FC_Z_sc","FS_Z_sc","FO_Z_sc","SI_Z_sc","SL_Z_sc","CU_Z_sc","KC_Z_sc","EP_Z_sc","CH_Z_sc","SC_Z_sc","KN_Z_sc","wFA_sc","wFC_sc","wFS_sc","wFO_sc","wSI_sc","wSL_sc","wCU_sc","wKC_sc","wEP_sc","wCH_sc","wSC_sc","wKN_sc","wFA_per_c_sc","wFC_per_c_sc","wFS_per_c_sc","wFO_per_c_sc","wSI_per_c_sc","wSL_per_c_sc","wCU_per_c_sc","wKC_per_c_sc","wEP_per_c_sc","wCH_per_c_sc","wSC_per_c_sc","wKN_per_c_sc","OSwing_pct_sc","ZSwing_pct_sc","Swing_pct_sc","OContact_pct_sc","ZContact_pct_sc","Contact_pct_sc","Zone_pct_sc", "botOvr","botStf","botCmd","Stuff_plus","Location_plus","Pitching_plus")
+  
+norm_stats <- cbind(norm_stats, (fangraphs_season_level[, names(fangraphs_season_level) %in% adjusted_vars]))
+```
+
+### Add the pitch arsenal count
+
+Each pitcher has ratings for pitches that they throw, totaling the count of these statistics provides a measure of pitch types in their "arsenal". This is done for both pitch type metrics.
+
+```{r}
+bot <- (fangraphs_season_level[, names(fangraphs_season_level) %in% c("botOvr_CH","botOvr_CU","botOvr_FA","botOvr_SI","botOvr_SL","botOvr_KC","botOvr_FC","botOvr_FS")])
+
+bot$non_na_count <- rowSums(!is.na(bot))
+
+pitch_plus <- (fangraphs_season_level[, names(fangraphs_season_level) %in% c("Pit_plus_CH","Pit_plus_CU","Pit_plus_FA","Pit_plus_SI","Pit_plus_SL","Pit_plus_KC","Pit_plus_FC","Pit_plus_FS", "Pit_plus_FO")])
+
+pitch_plus$non_na_count <- rowSums(!is.na(bot))
+
+pitch_arsenal <- as.data.frame(cbind(bot$non_na_count,pitch_plus$non_na_count))
+colnames(pitch_arsenal) <- c("bot_count", "pitch_plus_count")
+  
+norm_stats <- cbind(norm_stats,pitch_arsenal)
+
+plot(pitch_arsenal)
+
+```
+
+### Normalize to season
+
+normalized stat = actual stat  + ((actual stat - min stat) \* (league average stat for that year))
+
+```{r message=FALSE, warning=FALSE}
+with_season <- cbind(fangraphs_season_level$Season, norm_stats) 
+colnames(with_season) <- c("season",names(with_season)[-1])
+
+twenty_one <- with_season %>% filter(as.character(with_season[,1]) == 2021)
+normalized_21 <- data.frame(matrix(nrow = nrow(twenty_one), ncol = ncol(twenty_one)))
+colnames(normalized_21) <- colnames(twenty_one)
+for (col in names(twenty_one)) {
+  column_values <- twenty_one[[col]]
+  normalized_values <- column_values + 
+                            ((column_values - min(column_values, na.rm = TRUE)) 
+                                    * mean(column_values, na.rm = TRUE))
+  normalized_21[[col]] <- normalized_values
+}
+
+twenty_two <-  with_season %>% filter(as.character(with_season[,1]) == 2022)
+normalized_22 <- data.frame(matrix(nrow = nrow(twenty_two), ncol = ncol(twenty_two)))
+colnames(normalized_22) <- colnames(twenty_two)
+for (col in names(twenty_two)) {
+  column_values <- twenty_two[[col]]
+  normalized_values <- column_values + 
+                            ((column_values - min(column_values, na.rm = TRUE)) 
+                                    * mean(column_values, na.rm = TRUE))
+  normalized_22[[col]] <- normalized_values
+}
+
+twenty_three <-  with_season %>% filter(as.character(with_season[,1]) == 2023)
+normalized_23 <- data.frame(matrix(nrow = nrow(twenty_three), ncol = ncol(twenty_three)))
+colnames(normalized_23) <- colnames(twenty_three)
+for (col in names(twenty_three)) {
+  column_values <- twenty_three[[col]]
+  normalized_values <- column_values + 
+                            ((column_values - min(column_values, na.rm = TRUE)) 
+                                    * mean(column_values, na.rm = TRUE))
+  normalized_23[[col]] <- normalized_values
+}
+
+normalized_dataset <- rbind(normalized_23, normalized_22, normalized_21)[-1]
+rm(normalized_23, twenty_one, normalized_22, twenty_two, normalized_21, twenty_three)
+```
+
+### Add age
+
+```{r}
+normalized_dataset$Age <- fangraphs_season_level$Age
+```
+
+# Impute Missing Values
+
+Using a random forest model missing values were imputed if the metric was below the missingness threshold of 5%
+
+```{r}
+missingness_threshold <- .05 * nrow(normalized_dataset) #max number of missing values 
+
+
+selected_normalized_dataset <- normalized_dataset[names(colSums(is.na(normalized_dataset))[colSums(is.na(normalized_dataset)) < missingness_threshold])]
+
+
+
+imputed_rf <- complete(mice(selected_normalized_dataset, method = "rf"))
+
+
+# Print the missing values 
+for (col_name in names(imputed_rf)) {
+  na_count <- sum(is.na(imputed_rf[[col_name]]))
+  if (na_count != 0) {
+    cat(col_name, ":", na_count, "\n")
+  }
+}
+
+
+
+# Remove columns with NAs
+imputed_rf <- imputed_rf[, colSums(is.na(imputed_rf)) == 0]
+
+
+
+```
+
+# Scale Data
+
+```{r}
+imputed_rf_scaled <- scale(imputed_rf)
+```
+
+# Variable Selection
+
+```{r}
+fangraphs_season_level$Role <- gsub("SP", "1", fangraphs_season_level$Role)
+fangraphs_season_level$Role <- gsub("RP", "0", fangraphs_season_level$Role)
+
+var_selection <- as.data.frame(cbind(fangraphs_season_level$Role, imputed_rf_scaled))
+var_selection <- apply(var_selection, 2, function(x) as.numeric(as.character(x)))
+var_selection <- as.data.frame(var_selection)
+```
+
+## Logistic regression
+
+Fit a logistic regression and extract significant variables
+
+```{r}
+logistic_regression <- Boruta(V1 ~ ., data = var_selection, doTrace = 0)
+logistic_regression
+# Perform a rough fix
+rough_fix_mod <- TentativeRoughFix(logistic_regression)
+# Get selected attributes
+logistic_signif <- getSelectedAttributes(rough_fix_mod)
+# Get variable importances
+importances <- attStats(rough_fix_mod)
+# Filter out reject variables
+selected_importances <- importances[importances$decision != "Rejected", ]
+# Order variables by mean importance in descending order
+ordered_importances <- selected_importances[order(-selected_importances$meanImp), ]
+# Print the ordered list of variable names and their importance
+print(ordered_importances[, "meanImp", drop = FALSE])
+
+# Plot feature importance
+plot(logistic_regression, ces.axis = 0.7, las = 2, xlab = "", main = "Feature importance")
+
+
+
+```
+
+## SVM
+
+Develop a support vector machine and extract the variables above the knee of importance curve.
+
+```{r}
+# Create the SVM model
+svm_model <- svm(factor(var_selection$V1) ~ ., data = var_selection)
+# Make predictions
+predictions <- predict(svm_model, var_selection)
+# Create a confusion matrix
+confusion_matrix <- table(Actual = var_selection$V1, Predicted = predictions)
+# Print the confusion matrix
+print(confusion_matrix)
+# Calculate weight vectors
+w <- t(svm_model$coefs) %*% svm_model$SV
+# Calculate the magnitude of the weights
+w_magnitude <- apply(w, 2, function(v) sqrt(sum(v^2)))
+# Sort the weights in decreasing order
+w_sorted <- sort(w_magnitude, decreasing = TRUE)
+
+# Print covariate importance
+cat("Covariate Importance:\n")
+for (i in seq_along(w_sorted)) {
+  cat(sprintf("Feature %d: %.4f\n", i, w_sorted[i]))
+}
+
+# Plot covariate importance
+plot(w_sorted, main = "Covariate Importance", xlab = "Features", ylab = "Importance")
+offset <- ifelse(seq_along(w_sorted)[1:22] %% 2 == 0, 1, -1) * 0.5
+text(seq_along(w_sorted)[1:22], w_sorted[1:22], labels = names(w_sorted)[1:22], pos = 4, cex = 0.8, xpd = TRUE, offset = offset, col = "blue", srt = 45)
+
+
+
+
+library(ggrepel)
+# Create a data frame for the annotations
+annotations_df <- data.frame(
+  x = seq_along(w_sorted),
+  y = w_sorted,
+  label = c(names(w_sorted)[1:22],rep("",139-22))
+)
+
+# Plot using ggplot2 and ggrepel
+ggplot(annotations_df, aes(x = x, y = y, label = label, color = y)) +
+  geom_point() +
+  geom_text_repel(
+    data = subset(annotations_df, x <= 22),  # Subset only the first 22 points
+    box.padding = 0.9,   # Adjust box padding for better spacing
+    point.padding = 0.9,  # Adjust point padding for better spacing
+    segment.size = 0.2,
+    segment.color = "black",
+    angle = 0,
+    min.segment.length = 0,
+    max.overlaps = 20,
+    seed = 3,
+    direction = c("x"),
+    xlim = c(0, 140),
+    show.legend = FALSE,
+    force = 10,
+    force_pull = 3
+  ) +
+  labs(title = "Covariate Importance", x = "Features", y = "Importance") +
+  scale_x_continuous(limits = c(0, max(annotations_df$x))) +
+  scale_y_continuous(limits = c(0,1.05*max(annotations_df$y)))+
+  geom_vline(xintercept = 22, linetype = "dashed", color = "grey") +
+  scale_color_gradient(low = "blue", high = "red", guide = "none")
+
+ggplot(annotations_df, aes(x = x, y = y, label = label, color = y)) +
+  geom_point() +
+  labs(title = "Covariate Importance", x = "Features", y = "Importance") +
+  scale_x_continuous(limits = c(0, max(annotations_df$x))) +
+  scale_y_continuous(limits = c(0,1.05*max(annotations_df$y)))+
+  geom_vline(xintercept = 22, linetype = "dashed", color = "grey") +
+  scale_color_gradient(low = "blue", high = "red", guide = "none")
+```
+
+# K Means Clustering
+
+## All Players
+
+### Logistic Regression Based
+
+Using the variables from the logistic regression previously developed, we developed a k-means clustering model for all players
+
+```{r}
+# get the important variables from the log reg
+important_vars <- rownames(ordered_importances)
+
+# Filter the data based on important variables
+logistic_filtered_data <- imputed_rf_scaled[, important_vars, drop = FALSE]
+```
+
+```{r}
+#optimal number of clusters
+opti_cluster(logistic_filtered_data)
+```
+
+```{r}
+# Perform the k-means clustering
+log_all_roles_clusters<- kmeans(logistic_filtered_data, 
+                                centers = 3, nstart = 20, iter.max = 20)
+
+
+#Plot Clusters
+cluster_plot(logistic_filtered_data,log_all_roles_clusters)
+
+# Retrive Max and Min stats for each group
+cluster_max_min(log_all_roles_clusters)
+
+
+# Pitching role Cluster Group plot
+role_split_plot(logistic_filtered_data,log_all_roles_clusters)
+```
+
+### SVM based K means
+
+```{r}
+svm_filtered_data <- imputed_rf_scaled[, names(w_sorted)[1:22], drop = FALSE]
+```
+
+```{r}
+# Optimal cluster number
+opti_cluster(svm_filtered_data)
+```
+
+```{r}
+# Perform the k-means clustering
+svm_all_roles_clusters<- kmeans(svm_filtered_data, centers = 3, nstart = 20, iter.max = 20)
+
+
+#Plot Clusters
+cluster_plot(svm_filtered_data,svm_all_roles_clusters)
+
+
+# Max and Min stats
+cluster_max_min(log_all_roles_clusters)
+
+
+
+# Pitching role Cluster Group plot
+role_split_plot(svm_filtered_data,svm_all_roles_clusters)
+
+
+```
+
+## Starting Pitchers - SVM
+
+```{r}
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf_scaled[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+starting_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+starting_pitchers <- starting_pitchers %>% filter(Role == 1)
+# Remove the 'Role' column
+starting_pitchers <- starting_pitchers[, -which(names(starting_pitchers) == "Role")]
+# Convert character columns to numeric
+starting_pitchers <- sapply(starting_pitchers, as.numeric)
+
+
+# Optimal number of clusters
+opti_cluster(starting_pitchers)
+
+
+# Perform the k-means clustering
+svm_starting_clusters <- kmeans(starting_pitchers, centers = 3, nstart = 20, iter.max = 20)
+
+
+#Plot Clusters
+cluster_plot(starting_pitchers,svm_starting_clusters)
+
+
+# Retrive Max and Min stats for each group
+cluster_max_min(svm_starting_clusters)
+```
+
+## Relief Pitchers
+
+```{r}
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf_scaled[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the Role column
+relief_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+relief_pitchers <- relief_pitchers %>% filter(Role == 0)
+# Remove the Role column
+relief_pitchers <- relief_pitchers[, -which(names(relief_pitchers) == "Role")]
+# Convert character columns to numeric
+relief_pitchers <- sapply(relief_pitchers, as.numeric)
+
+
+# Optimal number of clusters
+opti_cluster(relief_pitchers)
+
+
+# Perform the k-means clustering
+svm_relief_clusters <- kmeans(relief_pitchers, centers = 3, nstart = 20, iter.max = 20)
+
+
+#Plot Clusters
+cluster_plot(relief_pitchers,svm_relief_clusters)
+
+
+# Retrive Max and Min stats for each group
+cluster_max_min(svm_relief_clusters)
+```
+
+# Export Pitchers and Their Groups
+
+```{r}
+starters <- fangraphs_season_level %>% 
+  filter(Role == 1) %>%
+  mutate(Group = svm_starting_clusters$cluster) %>%
+  select(Group, everything())
+#write.csv(starters,"file_path/starters.csv")
+
+relief <- fangraphs_season_level %>% 
+  filter(Role == 0) %>%
+  mutate(Group = svm_relief_clusters$cluster) %>%
+  select(Group, everything())
+#write.csv(relief,"file_path/relivers.csv")
+
+
+```
+
+# Starter Group Analysis
+
+```{r}
+# Starting pitchers 
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+starting_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+starting_pitchers <- starting_pitchers %>% filter(Role == 1)
+# Remove the 'Role' column
+starting_pitchers <- starting_pitchers[, -which(names(starting_pitchers) == "Role")]
+# Convert character columns to numeric
+starting_pitchers <- sapply(starting_pitchers, as.numeric)
+# Label starter groups 
+starting_pitchers <- as.data.frame(cbind(starting_pitchers, group = svm_starting_clusters$cluster))
+
+
+# Relief pitchers 
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+relief_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+relief_pitchers <- relief_pitchers %>% filter(Role == 0)
+# Remove the 'Role' column
+relief_pitchers <- relief_pitchers[, -which(names(relief_pitchers) == "Role")]
+# Convert character columns to numeric
+relief_pitchers <- as.data.frame(sapply(relief_pitchers, as.numeric))
+
+
+# t tests
+starting_group_comparison <- matrix(NA, nrow = 22, ncol = 3)
+for (g in 1:3) {
+  for (stat in 1:22) {
+    a <- starting_pitchers %>% filter(group == g)
+    result <- t.test(a[, stat], relief_pitchers[, names(relief_pitchers) == names(a)[stat]])
+    starting_group_comparison[stat, g] <- result$p.value  
+  }
+}
+print(starting_group_comparison)
+
+
+
+
+# Average minimum distance
+starting_group_distance <- matrix(NA, nrow = 22, ncol = 3)
+for (g in 1:3) {
+  for (stat in 1:22) {
+    a <- starting_pitchers %>% filter(group == g)
+    distance <- (1/nrow(a)) * sum(sapply(1:nrow(a), function(i) min(abs(a[i, stat] - relief_pitchers[, names(relief_pitchers) == names(a)[stat]])))) +
+                (1/nrow(relief_pitchers)) * sum(sapply(1:nrow(relief_pitchers), function(j) min(abs(a[, stat] - relief_pitchers[j, names(relief_pitchers) == names(a)[stat]]))))
+    
+    starting_group_distance[stat, g] <- distance
+  }
+}
+print(starting_group_distance)
+colSums(starting_group_distance)
+cat("Starting group", which.min(colSums(starting_group_distance)), "is the most similar to relief pitchers.\n")
+
+
+
+
+
+# Boxplots
+boxplot_list <- list()
+for (stat_col_name in names(starting_pitchers)[1:22]) {
+  
+  relief_data <- relief_pitchers[, stat_col_name]
+  starting_group_data <- lapply(1:3, function(g) starting_pitchers[starting_pitchers$group == g, stat_col_name])
+  
+  all_data <- c(list(Relief = relief_data), setNames(starting_group_data, paste0("Starting Group", 1:3)))
+  
+  boxplot(all_data, 
+          main = paste("Boxplot for Variable:", stat_col_name),
+          ylab = paste("Value of", stat_col_name),
+          col = c("blue", "red", "green", "purple"))
+  
+  boxplot_list[[stat_col_name]] <- all_data
+}
+```
+
+# Relief Group Analysis
+
+```{r}
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+relief_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+relief_pitchers <- relief_pitchers %>% filter(Role == 0)
+# Remove the 'Role' column
+relief_pitchers <- relief_pitchers[, -which(names(relief_pitchers) == "Role")]
+# Convert character columns to numeric
+relief_pitchers <- sapply(relief_pitchers, as.numeric)
+# Label starter groups 
+relief_pitchers <- as.data.frame(cbind(relief_pitchers, group = svm_relief_clusters$cluster))
+
+
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+starting_pitchers <- as.data.frame(cbind(svm_filtered_data, Role = fangraphs_season_level$Role))
+# Filter starting pitchers 
+starting_pitchers <- starting_pitchers %>% filter(Role == 1)
+# Remove the 'Role' column
+starting_pitchers <- starting_pitchers[, -which(names(starting_pitchers) == "Role")]
+# Convert character columns to numeric
+starting_pitchers <- as.data.frame(sapply(starting_pitchers, as.numeric))
+
+
+
+# t test
+relief_group_comparison <- matrix(NA, nrow = 22, ncol = 3)
+for (g in 1:3) {
+  for (stat in 1:22) {
+    a <- relief_pitchers %>% filter(group == g)
+    result <- t.test(a[, stat], starting_pitchers[, names(starting_pitchers) == names(a)[stat]])
+    relief_group_comparison[stat, g] <- result$p.value  # Store p-values in the matrix
+  }
+}
+print(relief_group_comparison)
+
+
+
+
+# Average minimum disatnce 
+relief_group_distance <- matrix(NA, nrow = 22, ncol = 3)
+for (g in 1:3) {
+  for (stat in 1:22) {
+    a <- relief_pitchers %>% filter(group == g)
+    distance <- (1/nrow(a)) * sum(sapply(1:nrow(a), function(i) min(abs(a[i, stat] - starting_pitchers[, names(starting_pitchers) == names(a)[stat]])))) +
+                (1/nrow(starting_pitchers)) * sum(sapply(1:nrow(starting_pitchers), function(j) min(abs(a[, stat] - starting_pitchers[j, names(starting_pitchers) == names(a)[stat]]))))
+    
+    relief_group_distance[stat, g] <- distance
+  }
+}
+print(relief_group_distance)
+colSums(relief_group_distance)
+cat("Relief group", which.min(colSums(relief_group_distance)), "is the most similar to starting pitchers.\n")
+
+
+# Box plots
+boxplot_list <- list()
+for (stat_col_name in names(relief_pitchers)[1:22]) {
+  
+  starting_data <- starting_pitchers[, stat_col_name]
+  
+  relief_group_data <- lapply(1:3, function(g) relief_pitchers[relief_pitchers$group == g, stat_col_name])
+  
+
+  all_data <- c(list(Starting = starting_data), setNames(relief_group_data, paste0("Relief Group", 1:3)))
+  
+  boxplot(all_data, 
+          main = paste("Boxplot for Variable:", stat_col_name),
+          ylab = paste("Value of", stat_col_name),
+          col = c("blue", "red", "green", "purple"))
+  
+  boxplot_list[[stat_col_name]] <- all_data
+}
+```
+
+# PCA Ranking
+
+## All Players
+
+```{r}
+# PCA
+pca_ranking_model_all <- prcomp(svm_filtered_data, scale. = T, center = T)
+biplot(pca_ranking_model_all)
+eigenvalues <- pca_ranking_model_all$sdev^2
+total_variance <- sum(eigenvalues)
+explained_variance <- cumsum(eigenvalues) / total_variance
+
+scree_data <- data.frame(PC = 1:length(eigenvalues), Eigenvalue = eigenvalues, Explained_Variance = explained_variance)
+
+scree_plot <- ggplot(scree_data, aes(x = PC)) +
+  geom_point(aes(y = Eigenvalue), color = "blue") +
+  geom_line(aes(y = Eigenvalue), color = "blue") +
+  geom_line(aes(y = Explained_Variance), color = "red", linetype = "dashed") +
+  scale_y_continuous(expand = c(0, 0), name = "Eigenvalue") +
+  scale_y_continuous(sec.axis = sec_axis(~., name = "Explained Variance (%)")) +
+  labs(title = "Scree Plot of Principal Components Analysis",
+       x = "Principal Component",
+       y = "Eigenvalue") +
+  theme_minimal()
+print(scree_plot)
+kneedle(1:22,pca_ranking_model_all$sdev)
+
+
+
+
+# PCA scores and SVM variable correlations
+pca_svm_var_corr <- matrix(NA, nrow = 22, ncol = as.numeric(kneedle(1:22,pca_ranking_model_all$sdev)[1]))
+for (j in 1:22) {
+  for (i in 1:as.numeric(kneedle(1:22,pca_ranking_model_all$sdev)[1])) {
+    pca_svm_var_corr[j, i] <- cor(svm_filtered_data[,j], pca_ranking_model_all$x[,i])
+  }
+}
+
+
+pca_svm_var_corr <- as.data.frame(pca_svm_var_corr)
+colnames(pca_svm_var_corr) <- c(1:as.numeric(kneedle(1:22,pca_ranking_model_all$sdev)[1]))
+rownames(pca_svm_var_corr) <- names(svm_filtered_data[1:22])
+heatmap_data <- as.data.frame(pca_svm_var_corr) %>%
+  rownames_to_column(var = "Var2") %>%
+  pivot_longer(cols = -Var2, names_to = "Var1", values_to = "value")
+
+heatmap_plot <- ggplot(heatmap_data, aes(x = Var2, y = factor(Var1), fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       limits = c(-1, 1), na.value = "white", midpoint = 0) +
+  labs(title = "PCA Score Correlations",
+       x = "Statistics",
+       y = "Principal Components") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(heatmap_plot)
+
+
+
+###############################################################
+
+
+
+
+
+
+# Optimal PCA scores and WAR, ERA, and FIP correlations
+pca_ranking_model_check <- data.frame(pca_ranking_model_all$x[, 1:22], 
+                                      fangraphs_season_level$WAR, 
+                                      fangraphs_season_level$ERA, 
+                                      fangraphs_season_level$FIP, 
+                                      fangraphs_season_level$xFIP, 
+                                      fangraphs_season_level$Dollars, 
+                                      fangraphs_season_level$WPA)
+
+pca_ranking_var_corr <- matrix(NA, nrow = 22, ncol = 6)
+
+for (j in 1:22) {
+  for (i in 1:6) {
+    pca_ranking_var_corr[j, i] <- cor(pca_ranking_model_check[, j], pca_ranking_model_check[, i + 22])
+  }
+}
+
+colnames(pca_ranking_var_corr) <- c("WAR", "ERA", "FIP", "xFIP", "Dollars","WPA")
+
+heatmap_data <- as.data.frame(pca_ranking_var_corr) %>%
+  rownames_to_column(var = "Var2") %>%
+  pivot_longer(cols = -Var2, names_to = "Var1", values_to = "value")
+
+heatmap_plot <- ggplot(heatmap_data, aes(y = factor(Var2, levels = 1:22), x = factor(Var1), fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                        na.value = "white", midpoint = 0) +
+  labs(title = "PCA Score and Statistic Correlations",
+       x = "Statistics",
+       y = "Principal Components") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# Display the heatmap without the legend
+print(heatmap_plot)
+
+```
+
+## Starter --\> Relief PCA Ranking
+
+```{r}
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+starting_pitchers <- as.data.frame(cbind(svm_filtered_data, 
+                                         Role = fangraphs_season_level$Role,
+                                         id=fangraphs_season_level$PlayerId,
+                                         szn=fangraphs_season_level$Season,
+                                         name=fangraphs_season_level$NameASCII,
+                                         IP=fangraphs_season_level$IP))
+# Filter starting pitchers 
+starting_pitchers <- starting_pitchers %>% filter(Role == 1)
+# Remove the 'Role' column
+starting_pitchers <- starting_pitchers[, -which(names(starting_pitchers) == "Role")]
+# Label starter groups 
+starting_pitchers <- as.data.frame(cbind(starting_pitchers, group = svm_starting_clusters$cluster))
+# Select optimal group
+starting_pitchers <- starting_pitchers[starting_pitchers$group == which.min(colSums(starting_group_distance)),]
+
+
+# get PCA scores from overall model 
+pc_1 <- pca_ranking_model_all$rotation[, 1]
+# Check if variable names match
+names_match <- names(pc_1) == names(starting_pitchers)[1:22]
+# Check if all variable names match
+if (all(names_match)) {
+  # Initialize an empty vector to store projected scores
+  pca_scores <- numeric(nrow(starting_pitchers))
+  # Perform matrix multiplication for each row
+  for (i in 1:nrow(starting_pitchers)) {
+    pca_scores[i] <- as.numeric(as.matrix(pc_1)) %*% as.numeric(as.matrix(starting_pitchers[i, 1:22]))
+  }
+  starting_pitchers$pca_score <- pca_scores
+  #print(starting_pitchers)
+} else {
+  print("Variable names do not match.")
+}
+
+
+# Sort Rankings
+starting_pitchers <- starting_pitchers%>%filter(starting_pitchers$IP > 25)
+start_to_relief_top_prospects <- starting_pitchers[order(-starting_pitchers$pca_score), ]
+start_to_relief_top_prospects <- head(start_to_relief_top_prospects, 10)
+print(start_to_relief_top_prospects[,c("name", "szn", "IP")])
+
+
+starting_pitchers %>% 
+  filter(szn == 2023) %>% 
+  arrange(desc(pca_score))
+
+
+```
+
+## Relief --\> Starter PCA Ranking
+
+```{r}
+# Extract the columns needed for SVM
+svm_filtered_data <- imputed_rf[, names(w_sorted)[1:22], drop = FALSE]
+# Combine with the 'Role' column
+relieving_pitchers <- as.data.frame(cbind(svm_filtered_data, 
+                                         Role = fangraphs_season_level$Role,
+                                         id=fangraphs_season_level$PlayerId,
+                                         szn=fangraphs_season_level$Season,
+                                         name=fangraphs_season_level$NameASCII,
+                                         IP=fangraphs_season_level$IP))
+# Filter starting pitchers 
+relieving_pitchers <- relieving_pitchers %>% filter(Role == 0)
+# Remove the 'Role' column
+relieving_pitchers <- relieving_pitchers[, -which(names(relieving_pitchers) == "Role")]
+# Label starter groups 
+relieving_pitchers <- as.data.frame(cbind(relieving_pitchers, group = svm_relief_clusters$cluster))
+# Select optimal group
+relieving_pitchers <- relieving_pitchers[relieving_pitchers$group == which.min(colSums(relief_group_distance)),]
+
+
+# get PCA scores from overall model 
+pc_1 <- pca_ranking_model_all$rotation[, 1]
+# Check if variable names match
+names_match <- names(pc_1) == names(relieving_pitchers)[1:22]
+# Check if all variable names match
+if (all(names_match)) {
+  # Initialize an empty vector to store projected scores
+  pca_scores <- numeric(nrow(relieving_pitchers))
+  # Perform matrix multiplication for each row
+  for (i in 1:nrow(relieving_pitchers)) {
+    pca_scores[i] <- as.numeric(as.matrix(pc_1)) %*% as.numeric(as.matrix(relieving_pitchers[i, 1:22]))
+  }
+  relieving_pitchers$pca_score <- pca_scores
+  #print(relieving_pitchers)
+} else {
+  print("Variable names do not match.")
+}
+
+
+# Sort Rankings
+relieving_pitchers <- relieving_pitchers%>%filter(relieving_pitchers$IP > 25)
+relief_to_start_top_prospects <- relieving_pitchers[order(-relieving_pitchers$pca_score), ]
+relief_to_start_top_prospects <- head(relief_to_start_top_prospects, 10)
+print(relief_to_start_top_prospects[,c("name", "szn", "IP")])
+
+relieving_pitchers %>% 
+  filter(szn == 2023) %>% 
+  arrange(desc(pca_score))
+
+```
+
+# 2024 Top Prospects
+
+## Jaime Barria
+
+```{r}
+fangraphs_season_level %>% filter(PlayerId == 18356)
+```
+
+## Chris Flexen
+
+```{r}
+fangraphs_season_level %>% filter(PlayerId == 13896)
+```
+
+## Alex Cobb
+
+```{r}
+fangraphs_season_level %>% filter(PlayerId == 6562) -> alex
+
+alex
+
+round(alex[, c(names(w_sorted)[1:22], "Season"), drop = FALSE],2)
+
+
+```
+
+## Shelby Miller
+
+```{r}
+fangraphs_season_level %>% filter(PlayerId == 10197) -> shelby
+
+shelby
+
+round(shelby[, c(names(w_sorted)[1:22], "Season"), drop = FALSE],2)
+
+```
