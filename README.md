@@ -1,6 +1,6 @@
 # SpartanDawgs
 
-This repository contains the Spartan Dawgs submission to the Cinncinati Reds Hackathon 2024
+This repository contains the Spartan Dawgs submission to the Cincinnati Reds Hackathon 2024
 
 Please reach out to Arjun Parmar parmarar@msu.edu with any questions 
 
