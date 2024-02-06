@@ -11,4 +11,4 @@ Please reach out to Arjun Parmar parmarar@msu.edu with any questions
 
  All code witten for the analysis is in /code
 
- Please read "PitchPerfect Analytics- K-Means Clustering and PCA in Pitching Role Evaluation" for an in depth explination of the project
+ Please read "Beyond the Mound: K-Means Clustering and PCA in Pitching Role Evaluation" for an in depth explination of the project
