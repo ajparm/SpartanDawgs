@@ -7,7 +7,7 @@ Please reach out to Arjun Parmar parmarar@msu.edu with any questions
 
 
 
- All data used for this anlysis is in /data 
+ All data used for this analysis is in /data 
 
  All code witten for the analysis is in /code
 
